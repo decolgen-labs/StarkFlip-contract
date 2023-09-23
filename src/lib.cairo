@@ -3,8 +3,8 @@ use starknet::ContractAddress;
 #[starknet::interface]
 trait IStarkFlip<TContractState> {
     fn get_owner(self: @TContractState) -> ContractAddress;
-    fn get_name(self: @TContractState) -> felt252;
-    fn set_name(ref self: TContractState, _name: felt252);
+    fn get_contract_name(self: @TContractState) -> felt252;
+    fn set_contract_name(ref self: TContractState, _name: felt252);
     fn set_partnership(ref self: TContractState, _target: ContractAddress, _active: bool);
     fn transfer_ownership(ref self: TContractState, _target: ContractAddress);
 }
@@ -67,11 +67,11 @@ mod StarkFlip {
             self.owner.read()
         }
 
-        fn get_name(self: @ContractState) -> felt252 {
+        fn get_contract_name(self: @ContractState) -> felt252 {
             self.name.read()
         }
 
-        fn set_name(ref self: ContractState, _name: felt252) {
+        fn set_contract_name(ref self: ContractState, _name: felt252) {
             Ownable::only_owner(@self);
             let prev_name = self.name.read();
             self.name.write(_name);
