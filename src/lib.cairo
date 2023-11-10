@@ -1,55 +1,41 @@
 use starknet::ContractAddress;
-
-#[starknet::interface]
-trait IERC20<TContractState> {
-    fn name(self: @TContractState) -> felt252;
-
-    fn symbol(self: @TContractState) -> felt252;
-
-    fn decimals(self: @TContractState) -> u8;
-
-    fn totalSupply(self: @TContractState) -> u256;
-
-    fn balanceOf(self: @TContractState, account: ContractAddress) -> u256;
-
-    fn allowance(self: @TContractState, owner: felt252, spender: felt252) -> u256;
-
-    fn transfer(ref self: TContractState, recipient: ContractAddress, amount: u256) -> bool;
-
-    fn transferFrom(
-        ref self: TContractState, sender: ContractAddress, recipient: ContractAddress, amount: u256
-    ) -> bool;
-
-    fn approve(ref self: TContractState, spender: felt252, amount: u256) -> bool;
-}
+use integer::{u256_overflowing_add};
+use openzeppelin::access::accesscontrol::AccessControl;
 
 #[starknet::interface]
 trait IStarkFlip<TContractState> {
-    fn get_owner(self: @TContractState) -> ContractAddress;
+    fn get_admin(self: @TContractState) -> ContractAddress;
     fn get_contract_name(self: @TContractState) -> felt252;
-    fn get_liquidity(self: @TContractState) -> u256;
-    fn set_contract_name(ref self: TContractState, _name: felt252);
-    fn set_partnership(ref self: TContractState, _target: ContractAddress, _active: bool);
-    fn transfer_ownership(ref self: TContractState, _target: ContractAddress);
-    fn add_liquidity(ref self: TContractState, _amount: felt252);
+    fn get_pool(self: @TContractState) -> u256;
+    fn get_shares(self: @TContractState, shareholder_address: ContractAddress) -> u256;
+    fn set_contract_name(ref self: TContractState, name: felt252);
+    fn set_partnership(ref self: TContractState, target: ContractAddress, active: bool);
+    fn transfer_ownership(ref self: TContractState, target: ContractAddress);
+    fn add_liquidity(ref self: TContractState, amount: u256);
+    fn withdraw_liquidity(ref self: TContractState, amount: u256);
 }
+
+const ADMIN_ROLE: felt252 = selector!("ADMIN_ROLE");
+const PARTNERSHIP_ROLE: felt252 = selector!("PARTNERSHIP_ROLE");
 
 #[starknet::contract]
 mod StarkFlip {
+    use openzeppelin::token::erc20::interface::IERC20CamelDispatcherTrait;
     use core::traits::Into;
+    use openzeppelin::token::erc20::interface::IERC20DispatcherTrait;
+    use openzeppelin::token::erc20::interface::{IERC20Dispatcher, IERC20CamelDispatcher};
     use starknet::{ContractAddress, get_caller_address, get_contract_address};
-    use super::{IStarkFlip, IERC20Dispatcher, IERC20DispatcherTrait};
+    use super::{IStarkFlip, AccessControl, ADMIN_ROLE, PARTNERSHIP_ROLE};
 
     // ------------------- Constant -------------------
 
     #[storage]
     struct Storage {
         eth_address: ContractAddress,
-        owner: ContractAddress,
         name: felt252,
-        address: ContractAddress,
-        role_partnership: LegacyMap::<ContractAddress, bool>,
-        liquid: u256,
+        admin: ContractAddress,
+        pool: u256,
+        shareholder: LegacyMap::<ContractAddress, u256>
     }
 
     // ------------------ Constructor ------------------
@@ -57,9 +43,15 @@ mod StarkFlip {
     fn constructor(
         ref self: ContractState, _owner: ContractAddress, _eth_address: ContractAddress
     ) {
-        self.owner.write(_owner);
+        // AccessControl initialization
+        let mut access_state = AccessControl::unsafe_new_contract_state();
+        AccessControl::InternalImpl::initializer(ref access_state);
+        AccessControl::InternalImpl::_grant_role(ref access_state, ADMIN_ROLE, _owner);
+
         self.eth_address.write(_eth_address);
-        self.name.write('StarkFlip')
+        self.admin.write(_owner);
+        self.name.write('StarkFlip');
+        self.pool.write(0)
     }
 
     // --------------------- Event ---------------------
@@ -69,15 +61,16 @@ mod StarkFlip {
         TransferOwnership: TransferOwnership,
         SetPartnership: SetPartnership,
         SetContractName: SetContractName,
-        AddLiquidity: AddLiquidity
+        AddLiquidity: AddLiquidity,
+        WithdrawLiquidity: WithdrawLiquidity
     }
 
     #[derive(Drop, starknet::Event)]
     struct TransferOwnership {
         #[key]
-        prev_owner: ContractAddress,
+        prev_admin: ContractAddress,
         #[key]
-        new_owner: ContractAddress
+        new_admin: ContractAddress
     }
 
     #[derive(Drop, starknet::Event)]
@@ -102,84 +95,120 @@ mod StarkFlip {
         amount: u256
     }
 
+    #[derive(Drop, starknet::Event)]
+    struct WithdrawLiquidity {
+        #[key]
+        role_address: ContractAddress,
+        amount: u256
+    }
+
     // --------------- External Accessors ---------------
     #[external(v0)]
     impl StarkFlipImpl of IStarkFlip<ContractState> {
-        fn get_owner(self: @ContractState) -> ContractAddress {
-            self.owner.read()
+        fn get_admin(self: @ContractState) -> ContractAddress {
+            self.admin.read()
         }
 
         fn get_contract_name(self: @ContractState) -> felt252 {
             self.name.read()
         }
 
-        fn get_liquidity(self: @ContractState) -> u256 {
-            self.liquid.read()
+        fn get_pool(self: @ContractState) -> u256 {
+            self.pool.read()
         }
 
-        fn set_contract_name(ref self: ContractState, _name: felt252) {
-            Ownable::only_owner(@self);
+        fn get_shares(self: @ContractState, shareholder_address: ContractAddress) -> u256 {
+            self.shareholder.read(shareholder_address)
+        }
+
+        fn set_contract_name(ref self: ContractState, name: felt252) {
+            let unsafe_state = AccessControl::unsafe_new_contract_state();
+            AccessControl::InternalImpl::assert_only_role(@unsafe_state, ADMIN_ROLE);
             let prev_name = self.name.read();
-            self.name.write(_name);
-            self.emit(SetContractName { prev_name, new_name: _name });
+            self.name.write(name);
+            self.emit(SetContractName { prev_name, new_name: name });
         }
 
-        fn set_partnership(ref self: ContractState, _target: ContractAddress, _active: bool) {
-            Ownable::only_owner(@self);
-            self.role_partnership.write(_target, _active);
-            self.emit(SetPartnership { partnership: _target, active: _active });
+        fn set_partnership(ref self: ContractState, target: ContractAddress, active: bool) {
+            let mut unsafe_state = AccessControl::unsafe_new_contract_state();
+            AccessControl::InternalImpl::assert_only_role(@unsafe_state, ADMIN_ROLE);
+
+            if active {
+                AccessControl::InternalImpl::_grant_role(
+                    ref unsafe_state, PARTNERSHIP_ROLE, target
+                );
+            } else {
+                AccessControl::InternalImpl::_revoke_role(
+                    ref unsafe_state, PARTNERSHIP_ROLE, target
+                );
+            }
+            self.emit(SetPartnership { partnership: target, active: active });
         }
 
-        fn transfer_ownership(ref self: ContractState, _target: ContractAddress) {
-            Ownable::only_owner(@self);
-            let prev_owner: ContractAddress = self.owner.read();
-            self.owner.write(_target);
-            self.emit(TransferOwnership { prev_owner, new_owner: _target });
+        fn transfer_ownership(ref self: ContractState, target: ContractAddress) {
+            let mut unsafe_state = AccessControl::unsafe_new_contract_state();
+            AccessControl::InternalImpl::assert_only_role(@unsafe_state, ADMIN_ROLE);
+
+            let prev_admin: ContractAddress = self.admin.read();
+            AccessControl::InternalImpl::_grant_role(ref unsafe_state, ADMIN_ROLE, target);
+            AccessControl::InternalImpl::_revoke_role(ref unsafe_state, ADMIN_ROLE, prev_admin);
+            self.admin.write(target);
+
+            self.emit(TransferOwnership { prev_admin, new_admin: target });
         }
 
-        fn add_liquidity(ref self: ContractState, _amount: felt252) {
-            Ownable::only_owner_and_partnership(@self);
-            let _from = get_caller_address();
+        fn add_liquidity(ref self: ContractState, amount: u256) {
+            let caller = get_caller_address();
+            Private::_has_permission(@self, caller);
+
             let this_contract = get_contract_address();
-            let balance: u256 = _amount.into();
             let allowance = IERC20Dispatcher { contract_address: self.eth_address.read() }
-                .allowance(_from.into(), this_contract.into());
-            assert(allowance >= balance, 'Allowance does not enough');
+                .allowance(caller.into(), this_contract.into());
+            assert(allowance >= amount, 'Allowance does not enough');
 
-            IERC20Dispatcher { contract_address: self.eth_address.read() }
-                .transferFrom(_from, this_contract, balance);
-            self.liquid.write(balance);
+            let new_stake_amount: u256 = amount + self.pool.read();
+            IERC20CamelDispatcher { contract_address: self.eth_address.read() }
+                .transferFrom(caller, this_contract, amount);
+            self.pool.write(new_stake_amount);
 
-            self.emit(AddLiquidity { role_address: _from, amount: balance })
+            // update share amount
+            let pre_shares = self.shareholder.read(caller);
+            self.shareholder.write(caller, pre_shares + amount);
+
+            self.emit(AddLiquidity { role_address: caller, amount })
+        }
+
+        fn withdraw_liquidity(ref self: ContractState, amount: u256) {
+            let caller = get_caller_address();
+            Private::_has_permission(@self, caller);
+
+            let pre_shares: u256 = self.get_shares(caller);
+            assert(amount <= pre_shares, 'Staked amount does not enough');
+
+            // update data in storage
+            let new_liquidity_amount: u256 = self.pool.read() - amount;
+            self.pool.write(new_liquidity_amount);
+
+            // update number of shares
+            self.shareholder.write(caller, pre_shares - amount);
+
+            IERC20CamelDispatcher { contract_address: self.eth_address.read() }
+                .transfer(caller, amount);
+
+            self.emit(WithdrawLiquidity { role_address: caller, amount })
         }
     }
-
-    // --------------- Internal Accessors ---------------
+    // --------------- Private Accessors ---------------
     #[generate_trait]
-    impl Ownable of IOwnable {
-        #[inline(always)]
-        fn is_owner(self: @ContractState) -> bool {
-            self.owner.read() == get_caller_address()
-        }
-
-        #[inline(always)]
-        fn is_partnership(self: @ContractState) -> bool {
-            self.role_partnership.read(get_caller_address())
-        }
-
-        fn only_owner(self: @ContractState) {
-            assert(Ownable::is_owner(self), 'Only for owner');
-        }
-
-        fn only_partnership(self: @ContractState) {
-            assert(Ownable::is_partnership(self), 'Only for partnership');
-        }
-
-
-        fn only_owner_and_partnership(self: @ContractState) {
+    impl Private of PrivateTrait {
+        fn _has_permission(self: @ContractState, target: ContractAddress) {
+            let unsafe_state = AccessControl::unsafe_new_contract_state();
             assert(
-                Ownable::is_owner(self) || Ownable::is_partnership(self),
-                'Only for owner and partnership'
+                AccessControl::AccessControlImpl::has_role(@unsafe_state, ADMIN_ROLE, target)
+                    || AccessControl::AccessControlImpl::has_role(
+                        @unsafe_state, PARTNERSHIP_ROLE, target
+                    ),
+                'Caller is missing role'
             );
         }
     }
