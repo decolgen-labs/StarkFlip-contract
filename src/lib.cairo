@@ -11,14 +11,16 @@ trait IStarkFlip<TContractState> {
     fn get_shares(self: @TContractState, shareholder_address: ContractAddress) -> u256;
     fn get_pool_staked(self: @TContractState, id: ContractAddress) -> u256;
     fn get_game_staked(self: @TContractState, id: ContractAddress) -> u256;
+    fn get_treasury(self: @TContractState) -> u256;
     fn set_contract_name(ref self: TContractState, name: felt252);
     fn set_partnership(ref self: TContractState, target: ContractAddress, active: bool);
     fn transfer_ownership(ref self: TContractState, target: ContractAddress);
     fn add_liquidity(ref self: TContractState, amount: u256);
     fn withdraw_liquidity(ref self: TContractState, amount: u256);
+    fn withdraw_treasury(ref self: TContractState, amount: u256);
     fn create_pool(
         ref self: TContractState,
-        payer_address: ContractAddress,
+        dealer: ContractAddress,
         min_stake_amount: u256,
         max_stake_amount: u256,
         staked_amount: u256,
@@ -69,8 +71,8 @@ mod StarkFlip {
     };
     use hash::{HashStateTrait, HashStateExTrait};
     use starknet::{
-        ContractAddress, get_caller_address, get_contract_address, get_execution_info, get_tx_info,
-        contract_address_const
+        ContractAddress, get_caller_address, get_contract_address, get_tx_info,
+        contract_address_const, get_block_timestamp
     };
     use super::{
         IStarkFlip, AccessControl, ADMIN_ROLE, PARTNERSHIP_ROLE, U64, STARKNET_DOMAIN_TYPE_HASH,
@@ -173,7 +175,7 @@ mod StarkFlip {
     struct CreatePool {
         #[key]
         id: ContractAddress,
-        payer_address: ContractAddress,
+        dealer: ContractAddress,
         min_stake_amount: u256,
         max_stake_amount: u256,
         staked_amount: u256,
@@ -213,7 +215,7 @@ mod StarkFlip {
     #[derive(Drop, Copy, starknet::Store)]
     struct Pool {
         id: ContractAddress,
-        payer_address: ContractAddress,
+        dealer: ContractAddress,
         min_stake_amount: u256,
         max_stake_amount: u256,
         staked_amount: u256,
@@ -257,6 +259,10 @@ mod StarkFlip {
 
         fn get_liquidity(self: @ContractState) -> u256 {
             self.liquidity.read()
+        }
+
+        fn get_treasury(self: @ContractState) -> u256 {
+            self.treasury.read()
         }
 
         fn get_shared_liquidity(self: @ContractState) -> u256 {
@@ -339,7 +345,7 @@ mod StarkFlip {
             Private::_has_permission(@self, caller);
 
             let pre_shares: u256 = self.get_shares(caller);
-            assert(amount <= pre_shares, 'Staked amount does not enough');
+            assert(amount <= pre_shares, 'STARKFLIP: STAKED NOT ENOUGH');
 
             // update data in storage
             let new_liquidity_amount: u256 = self.liquidity.read() - amount;
@@ -354,17 +360,31 @@ mod StarkFlip {
             self.emit(WithdrawLiquidity { role_address: caller, amount })
         }
 
+        fn withdraw_treasury(ref self: ContractState, amount: u256) {
+            let caller = get_caller_address();
+            Private::_only_Admin(@self, caller);
+
+            let pre_amount: u256 = self.treasury.read();
+            assert(amount <= pre_amount, 'STARKFLIP: TREASURY NOT ENOUGH');
+
+            // update data in storage
+            let new_treasury_amount: u256 = pre_amount - amount;
+            self.treasury.write(new_treasury_amount);
+
+            IERC20CamelDispatcher { contract_address: self.eth_address.read() }
+                .transfer(caller, amount);
+        }
+
         fn create_pool(
             ref self: ContractState,
-            payer_address: ContractAddress,
+            dealer: ContractAddress,
             min_stake_amount: u256,
             max_stake_amount: u256,
             staked_amount: u256,
             fee_rate: u128
         ) {
             let caller = get_caller_address();
-            let mut unsafe_state = AccessControl::unsafe_new_contract_state();
-            AccessControl::InternalImpl::assert_only_role(@unsafe_state, ADMIN_ROLE);
+            Private::_only_Admin(@self, caller);
 
             assert(min_stake_amount < max_stake_amount, 'INVALID min statke amount');
             let shared_liquidity = self.shared_liquidity.read();
@@ -372,16 +392,19 @@ mod StarkFlip {
 
             assert((liquidity - shared_liquidity) >= staked_amount, 'INSUFFICIENT LIQUIDITY');
 
+            let tx_hash = get_tx_info().unbox().transaction_hash;
+
             let mut pool_data = PedersenTrait::new(0);
-            pool_data = pool_data.update_with(payer_address);
+            pool_data = pool_data.update_with(dealer);
             pool_data = pool_data.update_with(min_stake_amount);
             pool_data = pool_data.update_with(max_stake_amount);
             pool_data = pool_data.update_with(staked_amount);
             pool_data = pool_data.update_with(fee_rate);
+            pool_data = pool_data.update_with(tx_hash);
 
             let id: ContractAddress = pool_data.finalize().try_into().unwrap();
             let new_pool = Pool {
-                id, payer_address, min_stake_amount, max_stake_amount, staked_amount, fee_rate
+                id, dealer, min_stake_amount, max_stake_amount, staked_amount, fee_rate
             };
 
             self.pools.write(id, new_pool);
@@ -390,23 +413,17 @@ mod StarkFlip {
             self
                 .emit(
                     CreatePool {
-                        id,
-                        payer_address,
-                        min_stake_amount,
-                        max_stake_amount,
-                        staked_amount,
-                        fee_rate
+                        id, dealer, min_stake_amount, max_stake_amount, staked_amount, fee_rate
                     }
                 )
         }
 
         fn topup_pool(ref self: ContractState, pool_id: ContractAddress, staked_amount: u256) {
             let caller = get_caller_address();
-            let mut unsafe_state = AccessControl::unsafe_new_contract_state();
-            AccessControl::InternalImpl::assert_only_role(@unsafe_state, ADMIN_ROLE);
+            Private::_has_permission(@self, caller);
 
             let mut pool = self.pools.read(pool_id);
-            assert(pool.payer_address != contract_address_const::<0>(), 'INVALID POOL');
+            assert(pool.dealer != contract_address_const::<0>(), 'STARKFLIP: INVALID POOL');
 
             let shared_liquidity = self.shared_liquidity.read();
             let liquidity = self.liquidity.read();
@@ -422,11 +439,12 @@ mod StarkFlip {
         fn create_game(
             ref self: ContractState, pool_id: ContractAddress, staked: u256, guess: u8,
         ) {
+            Private::_when_not_paused(@self);
             let player = get_caller_address();
             let this_contract = get_contract_address();
             let allowance = IERC20Dispatcher { contract_address: self.eth_address.read() }
                 .allowance(player.into(), this_contract.into());
-            assert(allowance >= staked, 'Allowance does not enough');
+            assert(allowance >= staked, 'STARKFLIP: Allowance not enough');
 
             IERC20CamelDispatcher { contract_address: self.eth_address.read() }
                 .transferFrom(player, this_contract, staked);
@@ -451,12 +469,13 @@ mod StarkFlip {
         }
 
         fn settle(ref self: ContractState, game_id: ContractAddress, signature: Array<felt252>) {
+            Private::_when_not_paused(@self);
             let mut game = self.games.read(game_id);
-            assert(game.pool != contract_address_const::<0>(), 'INVALID GAME');
+            assert(game.pool != contract_address_const::<0>(), 'STARKFLIP: INVALID GAME');
 
             let pool = self.pools.read(game.pool);
             let msgHash = ValidateSignature::get_message_hash(
-                @self, game.guess, game.seed, pool.payer_address
+                @self, game.guess, game.seed, pool.dealer
             );
 
             let sig_r = signature.at(0);
@@ -464,7 +483,7 @@ mod StarkFlip {
 
             assert(
                 ValidateSignature::is_valid_signature(
-                    @self, pool.payer_address, msgHash, signature
+                    @self, pool.dealer, msgHash, signature
                 ) == 'VALID',
                 'INVALID SIGNATURE'
             );
@@ -710,16 +729,24 @@ mod StarkFlip {
                     || AccessControl::AccessControlImpl::has_role(
                         @unsafe_state, PARTNERSHIP_ROLE, target
                     ),
-                'Caller is missing role'
+                'STARKFLIP: MISSING ROLE'
+            );
+        }
+
+        fn _only_Admin(self: @ContractState, target: ContractAddress) {
+            let unsafe_state = AccessControl::unsafe_new_contract_state();
+            assert(
+                AccessControl::AccessControlImpl::has_role(@unsafe_state, ADMIN_ROLE, target),
+                'STARKFLIP: ONLY ADMIN ROLE'
             );
         }
 
         fn _when_not_paused(self: @ContractState) {
-            assert(!self.paused.read(), 'Contract is paused');
+            assert(!self.paused.read(), 'STARKFLIP: Contract paused');
         }
 
         fn _when_paused(self: @ContractState) {
-            assert(self.paused.read(), 'Contract is not paused');
+            assert(self.paused.read(), 'STARKFLIP: Contract not paused');
         }
 
         fn _update_liquidity(ref self: ContractState, amount: u256) {
@@ -744,18 +771,20 @@ mod StarkFlip {
             staked: u256,
             seed: u128
         ) -> (ContractAddress, u128, Game) {
-            assert(guess == 1 || guess == 0, 'INVALID GUESS');
+            assert(guess == 1 || guess == 0, 'STARKFLIP: INVALID GUESS');
 
             let mut pool: Pool = self.pools.read(pool_id);
             assert(
                 staked >= pool.min_stake_amount && staked <= pool.max_stake_amount,
-                'INVALID STAKE AMOUNT'
+                'STARKFLIP: INVALID STAKED'
             );
-            assert(pool.staked_amount >= staked, 'INSUFFICIENT STAKE AMOUNT');
+            assert(pool.staked_amount >= staked, 'STARKFLIP: INSUFFICIENT STAKED');
 
             let total_staked = staked * 2;
             pool.staked_amount = pool.staked_amount - staked;
             self.pools.write(pool_id, pool);
+
+            let block_timestamp = get_block_timestamp();
 
             let fee_rate = pool.fee_rate;
             let mut game_data = PedersenTrait::new(0);
@@ -765,6 +794,7 @@ mod StarkFlip {
             game_data = game_data.update_with(staked);
             game_data = game_data.update_with(seed);
             game_data = game_data.update_with(fee_rate);
+            game_data = game_data.update_with(block_timestamp);
 
             let id: ContractAddress = game_data.finalize().try_into().unwrap();
             let new_game = Game {
