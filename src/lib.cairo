@@ -21,13 +21,12 @@ trait IStarkFlip<TContractState> {
         fee_rate: u128
     );
     fn topup_pool(ref self: TContractState, pool_id: ContractAddress, staked_amount: u256);
+    fn withdraw_liquidity_pool(ref self: TContractState, pool_id: ContractAddress, amount: u256);
     fn create_game(ref self: TContractState, pool_id: ContractAddress, staked: u256, guess: u8);
     fn settle(ref self: TContractState, game_id: ContractAddress, signature: Array<felt252>);
     fn cancel_game(ref self: TContractState, game_id: ContractAddress);
     fn test_get_message_hash(
-        self: @TContractState,
-        game_id: ContractAddress,
-        // signer: ContractAddress,
+        self: @TContractState, game_id: ContractAddress, // signer: ContractAddress,
         // guess: u8,
         // seed: u128,
         signature: Array<felt252>
@@ -394,6 +393,23 @@ mod StarkFlip {
             self.emit(TopupPool { id: pool_id, staked_amount })
         }
 
+        fn withdraw_liquidity_pool(
+            ref self: ContractState, pool_id: ContractAddress, amount: u256
+        ) {
+            let caller = get_caller_address();
+            Private::_has_permission(@self, caller);
+
+            let mut pool = self.pools.read(pool_id);
+            assert(pool.dealer != contract_address_const::<0>(), 'STARKFLIP: INVALID POOL');
+            assert(pool.staked_amount >= amount, 'INSUFFICIENT LIQUIDITY');
+
+            pool.staked_amount -= amount;
+            self.pools.write(pool_id, pool);
+            let new_shared_liquidity = self.shared_liquidity.read() - amount;
+            self.shared_liquidity.write(new_shared_liquidity);
+        }
+
+
         fn create_game(
             ref self: ContractState, pool_id: ContractAddress, staked: u256, guess: u8,
         ) {
@@ -465,14 +481,14 @@ mod StarkFlip {
 
             if (player_won) {
                 Private::_update_liquidity(ref self, (self.liquidity.read() - reward));
-                Private::_update_pool_staked(ref self, pool.id, pool.staked_amount - reward);
+                Private::_update_pool_staked(ref self, pool.id, reward, 2);
                 Private::_update_shared_liquidity(ref self, self.shared_liquidity.read() - reward);
 
                 IERC20CamelDispatcher { contract_address: self.eth_address.read() }
                     .transfer(game.player, total_staked);
             } else {
                 Private::_update_liquidity(ref self, (self.liquidity.read() + reward));
-                Private::_update_pool_staked(ref self, pool.id, pool.staked_amount + reward);
+                Private::_update_pool_staked(ref self, pool.id, reward, 1);
                 Private::_update_shared_liquidity(ref self, self.shared_liquidity.read() + reward);
             }
 
@@ -498,16 +514,14 @@ mod StarkFlip {
             self.games.write(game_id, game);
 
             let original_stake_amount = game.staked / 2;
-            Private::_update_pool_staked(ref self, pool.id, pool.staked_amount + original_stake_amount);
+            Private::_update_pool_staked(ref self, pool.id, original_stake_amount, 1);
 
             IERC20CamelDispatcher { contract_address: self.eth_address.read() }
                 .transfer(game.player, original_stake_amount);
         }
 
         fn test_get_message_hash(
-            self: @ContractState,
-            game_id: ContractAddress,
-            // signer: ContractAddress,
+            self: @ContractState, game_id: ContractAddress, // signer: ContractAddress,
             // guess: u8,
             // seed: u128,
             signature: Array<felt252>
@@ -522,7 +536,9 @@ mod StarkFlip {
             let sig_s = signature.at(1);
 
             assert(
-                ValidateSignature::is_valid_signature(self, pool.dealer, msgHash, signature) == 'VALID',
+                ValidateSignature::is_valid_signature(
+                    self, pool.dealer, msgHash, signature
+                ) == 'VALID',
                 'INVALID SIGNATURE'
             );
 
@@ -771,9 +787,18 @@ mod StarkFlip {
             self.liquidity.write(amount);
         }
 
-        fn _update_pool_staked(ref self: ContractState, id: ContractAddress, amount: u256) {
+        fn _update_pool_staked(
+            ref self: ContractState, id: ContractAddress, amount: u256, option: u8
+        ) {
             let mut pool = self.pools.read(id);
-            pool.staked_amount = amount;
+
+            // option 1 for plus, 2 for minus
+            if option == 1 {
+                pool.staked_amount = pool.staked_amount + amount;
+            } else {
+                pool.staked_amount = pool.staked_amount - amount;
+            }
+
             self.pools.write(id, pool);
         }
 
