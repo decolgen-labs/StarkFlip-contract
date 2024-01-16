@@ -1,17 +1,11 @@
+// Copyright (C) 2024 Decolgen.
+
 use starknet::ContractAddress;
 use openzeppelin::access::accesscontrol::AccessControl;
 use array::ArrayTrait;
 
 #[starknet::interface]
 trait IStarkFlip<TContractState> {
-    fn get_admin(self: @TContractState) -> ContractAddress;
-    fn get_contract_name(self: @TContractState) -> felt252;
-    fn get_liquidity(self: @TContractState) -> u256;
-    fn get_shared_liquidity(self: @TContractState) -> u256;
-    fn get_shares(self: @TContractState, shareholder_address: ContractAddress) -> u256;
-    fn get_pool_staked(self: @TContractState, id: ContractAddress) -> u256;
-    fn get_game_staked(self: @TContractState, id: ContractAddress) -> u256;
-    fn get_treasury(self: @TContractState) -> u256;
     fn set_contract_name(ref self: TContractState, name: felt252);
     fn set_partnership(ref self: TContractState, target: ContractAddress, active: bool);
     fn transfer_ownership(ref self: TContractState, target: ContractAddress);
@@ -29,18 +23,15 @@ trait IStarkFlip<TContractState> {
     fn topup_pool(ref self: TContractState, pool_id: ContractAddress, staked_amount: u256);
     fn create_game(ref self: TContractState, pool_id: ContractAddress, staked: u256, guess: u8);
     fn settle(ref self: TContractState, game_id: ContractAddress, signature: Array<felt252>);
-    fn test_play(
+    fn cancel_game(ref self: TContractState, game_id: ContractAddress);
+    fn test_get_message_hash(
         self: @TContractState,
-        // game_id: ContractAddress,
-        // pool_id: ContractAddress,
-        // player: ContractAddress,
-        // fee_rate: u128,
-        signer: ContractAddress,
-        guess: u8,
-        // staked: u256,
-        seed: u128,
+        game_id: ContractAddress,
+        // signer: ContractAddress,
+        // guess: u8,
+        // seed: u128,
         signature: Array<felt252>
-    ) -> (felt252, felt252, felt252);
+    ) -> felt252;
 }
 
 const ADMIN_ROLE: felt252 = selector!("ADMIN_ROLE");
@@ -48,7 +39,7 @@ const PARTNERSHIP_ROLE: felt252 = selector!("PARTNERSHIP_ROLE");
 const STARKNET_DOMAIN_TYPE_HASH: felt252 =
     selector!("StarkNetDomain(name:felt,version:felt,chainId:felt)");
 const U256_TYPE_HASH: felt252 = selector!("u256(low:felt,high:felt)");
-const GAME_STRUCT_TYPE_HASH: felt252 = selector!("Settle(guess:u8,seed:u128)");
+const GAME_STRUCT_TYPE_HASH: felt252 = selector!("Settle(game_id:felt,guess:u8,seed:u128)");
 const U64: u128 = 0xffffffffffffffff_u128; // 2**64-1
 const FEE_PRECISION: u128 = 1_000_000;
 
@@ -72,7 +63,7 @@ mod StarkFlip {
     use hash::{HashStateTrait, HashStateExTrait};
     use starknet::{
         ContractAddress, get_caller_address, get_contract_address, get_tx_info,
-        contract_address_const, get_block_timestamp
+        contract_address_const, get_block_timestamp, contract_address_to_felt252
     };
     use super::{
         IStarkFlip, AccessControl, ADMIN_ROLE, PARTNERSHIP_ROLE, U64, STARKNET_DOMAIN_TYPE_HASH,
@@ -212,7 +203,7 @@ mod StarkFlip {
 
     // --------------------- Struct ---------------------
 
-    #[derive(Drop, Copy, starknet::Store)]
+    #[derive(Drop, Copy, Serde, starknet::Store)]
     struct Pool {
         id: ContractAddress,
         dealer: ContractAddress,
@@ -242,6 +233,7 @@ mod StarkFlip {
 
     #[derive(Drop, Copy, Serde, Hash)]
     struct Settle {
+        game_id: felt252,
         guess: u8,
         seed: u128
     }
@@ -249,40 +241,6 @@ mod StarkFlip {
     // --------------- External Accessors ---------------
     #[external(v0)]
     impl StarkFlipImpl of IStarkFlip<ContractState> {
-        fn get_admin(self: @ContractState) -> ContractAddress {
-            self.admin.read()
-        }
-
-        fn get_contract_name(self: @ContractState) -> felt252 {
-            self.name.read()
-        }
-
-        fn get_liquidity(self: @ContractState) -> u256 {
-            self.liquidity.read()
-        }
-
-        fn get_treasury(self: @ContractState) -> u256 {
-            self.treasury.read()
-        }
-
-        fn get_shared_liquidity(self: @ContractState) -> u256 {
-            self.shared_liquidity.read()
-        }
-
-        fn get_shares(self: @ContractState, shareholder_address: ContractAddress) -> u256 {
-            self.shareholder.read(shareholder_address)
-        }
-
-        fn get_pool_staked(self: @ContractState, id: ContractAddress) -> u256 {
-            let pool = self.pools.read(id);
-            pool.staked_amount
-        }
-
-        fn get_game_staked(self: @ContractState, id: ContractAddress) -> u256 {
-            let game = self.games.read(id);
-            game.staked
-        }
-
         fn set_contract_name(ref self: ContractState, name: felt252) {
             let unsafe_state = AccessControl::unsafe_new_contract_state();
             AccessControl::InternalImpl::assert_only_role(@unsafe_state, ADMIN_ROLE);
@@ -475,7 +433,7 @@ mod StarkFlip {
 
             let pool = self.pools.read(game.pool);
             let msgHash = ValidateSignature::get_message_hash(
-                @self, game.guess, game.seed, pool.dealer
+                @self, contract_address_to_felt252(game_id), game.guess, game.seed, pool.dealer
             );
 
             let sig_r = signature.at(0);
@@ -529,39 +487,51 @@ mod StarkFlip {
                 )
         }
 
-        fn test_play(
+        fn cancel_game(ref self: ContractState, game_id: ContractAddress) {
+            let caller = get_caller_address();
+            Private::_only_Admin(@self, caller);
+            let mut game: Game = self.games.read(game_id);
+            assert(game.pool != contract_address_const::<0>(), 'STARKFLIP: INVALID GAME');
+
+            let pool = self.pools.read(game.pool);
+            game.pool = contract_address_const::<0>();
+            self.games.write(game_id, game);
+
+            let original_stake_amount = game.staked / 2;
+            Private::_update_pool_staked(ref self, pool.id, pool.staked_amount + original_stake_amount);
+
+            IERC20CamelDispatcher { contract_address: self.eth_address.read() }
+                .transfer(game.player, original_stake_amount);
+        }
+
+        fn test_get_message_hash(
             self: @ContractState,
-            // game_id: ContractAddress,
-            // pool_id: ContractAddress,
-            // player: ContractAddress,
-            // fee_rate: u128,
-            signer: ContractAddress,
-            guess: u8,
-            // staked: u256,
-            seed: u128,
+            game_id: ContractAddress,
+            // signer: ContractAddress,
+            // guess: u8,
+            // seed: u128,
             signature: Array<felt252>
-        ) -> (felt252, felt252, felt252) {
-            // let signer: ContractAddress = get_caller_address();
-            // let game = Game { id: game_id, pool: pool_id, player, staked, guess, seed, fee_rate };
-            let msgHash = ValidateSignature::get_message_hash(self, guess, seed, signer);
+        ) -> felt252 {
+            let game = self.games.read(game_id);
+            let pool = self.pools.read(game.pool);
+            let msgHash = ValidateSignature::get_message_hash(
+                self, contract_address_to_felt252(game_id), game.guess, game.seed, pool.dealer
+            );
 
             let sig_r = signature.at(0);
             let sig_s = signature.at(1);
 
             assert(
-                ValidateSignature::is_valid_signature(self, signer, msgHash, signature) == 'VALID',
+                ValidateSignature::is_valid_signature(self, pool.dealer, msgHash, signature) == 'VALID',
                 'INVALID SIGNATURE'
             );
 
-            let mut result = PoseidonTrait::new();
-            result = result.update(*sig_r);
-            result = result.update(*sig_s);
+            'VALID'
+        // let mut result = PoseidonTrait::new();
+        // result = result.update(*sig_r);
+        // result = result.update(*sig_s);
 
-            (*sig_r, *sig_s, result.finalize())
-        // assert(
-        //     ValidateSignature::is_valid_signature(@self, signer, msgHash, signature) == "VALID",
-        //     'INVALID SIGNATURE'
-        // );
+        // (*sig_r, *sig_s, result.finalize())
 
         // let s0 = self.s0.read();
         // let s1 = self.s1.read();
@@ -610,12 +580,11 @@ mod StarkFlip {
             self: @ContractState, signer: ContractAddress, hash: felt252, signature: Array<felt252>
         ) -> felt252;
         fn get_message_hash(
-            self: @ContractState, // game_id: ContractAddress,
-            // pool_id: ContractAddress,
+            self: @ContractState,
+            game_id: felt252, // pool_id: ContractAddress,
             // player: ContractAddress,
             // staked: u256,
-            guess: u8,
-            // seed: u128,
+            guess: u8, // seed: u128,
             // fee_rate: u128,
             seed: u128,
             signer: ContractAddress
@@ -632,7 +601,7 @@ mod StarkFlip {
         }
 
         fn get_message_hash(
-            self: @ContractState, guess: u8, seed: u128, signer: ContractAddress
+            self: @ContractState, game_id: felt252, guess: u8, seed: u128, signer: ContractAddress
         ) -> felt252 {
             let domain = StarknetDomain {
                 name: 'dappName', version: 1, chain_id: get_tx_info().unbox().chain_id
@@ -642,11 +611,59 @@ mod StarkFlip {
             state = state.update_with(domain.hash_struct());
             // This can be a field within the struct, it doesn't have to be get_caller_address().
             state = state.update_with(signer);
-            let settle = Settle { guess, seed };
+            let settle = Settle { game_id, guess, seed };
             state = state.update_with(settle.hash_struct());
             // Hashing with the amount of elements being hashed 
             state = state.update_with(4);
             state.finalize()
+        }
+    }
+
+    // --------------- View Accessors --------------
+
+    trait IViewFunction<TContractState> {
+        fn get_admin(self: @TContractState) -> ContractAddress;
+        fn get_contract_name(self: @TContractState) -> felt252;
+        fn get_liquidity(self: @TContractState) -> u256;
+        fn get_shared_liquidity(self: @TContractState) -> u256;
+        fn get_shares(self: @TContractState, shareholder_address: ContractAddress) -> u256;
+        fn get_pool(self: @TContractState, id: ContractAddress) -> Pool;
+        fn get_game(self: @TContractState, id: ContractAddress) -> Game;
+        fn get_treasury(self: @TContractState) -> u256;
+    }
+
+    #[external(v0)]
+    impl ViewFunction of IViewFunction<ContractState> {
+        fn get_admin(self: @ContractState) -> ContractAddress {
+            self.admin.read()
+        }
+
+        fn get_contract_name(self: @ContractState) -> felt252 {
+            self.name.read()
+        }
+
+        fn get_liquidity(self: @ContractState) -> u256 {
+            self.liquidity.read()
+        }
+
+        fn get_treasury(self: @ContractState) -> u256 {
+            self.treasury.read()
+        }
+
+        fn get_shared_liquidity(self: @ContractState) -> u256 {
+            self.shared_liquidity.read()
+        }
+
+        fn get_shares(self: @ContractState, shareholder_address: ContractAddress) -> u256 {
+            self.shareholder.read(shareholder_address)
+        }
+
+        fn get_pool(self: @ContractState, id: ContractAddress) -> Pool {
+            self.pools.read(id)
+        }
+
+        fn get_game(self: @ContractState, id: ContractAddress) -> Game {
+            self.games.read(id)
         }
     }
 
@@ -669,9 +686,10 @@ mod StarkFlip {
         fn hash_struct(self: @Settle) -> felt252 {
             let mut state = PedersenTrait::new(0);
             state = state.update_with(GAME_STRUCT_TYPE_HASH);
+            state = state.update_with(*self.game_id);
             state = state.update_with(*self.guess);
             state = state.update_with(*self.seed);
-            state = state.update_with(3);
+            state = state.update_with(4);
             state.finalize()
         }
     }
