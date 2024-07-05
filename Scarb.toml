@@ -1,11 +1,12 @@
 [package]
-name = "contracts"
+name = "starkflip"
 version = "0.1.0"
 
 [dependencies]
-starknet = "=2.2.0"
-openzeppelin = { git = "https://github.com/OpenZeppelin/cairo-contracts.git", tag = "v0.7.0" }
+starknet = "=2.6.3"
+openzeppelin = { git = "https://github.com/OpenZeppelin/cairo-contracts.git", tag = "v0.13.0" }
 
 [[target.starknet-contract]]
 sierra = true
 allowed-libfuncs-list.name = "experimental"
+casm = true
