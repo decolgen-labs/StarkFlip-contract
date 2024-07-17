@@ -343,6 +343,7 @@ mod StarkFlip {
             result = result.update_with(*sig_s);
             result = result.update_with(game.guess);
             result = result.update_with(game.seed);
+            result = result.update_with(4);
 
             let hash = result.finalize();
             let hash_u256: u256 = hash.into();
