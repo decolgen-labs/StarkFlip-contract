@@ -22,8 +22,7 @@ mod StarkFlip {
 
     const STARKNET_DOMAIN_TYPE_HASH: felt252 =
         selector!("StarkNetDomain(name:felt,version:felt,chainId:felt)");
-    const GAME_STRUCT_TYPE_HASH: felt252 =
-        selector!("Settle(game_id:felt,guess:u8,seed:u128,timestamp:u128)");
+    const GAME_STRUCT_TYPE_HASH: felt252 = selector!("Settle(game_id:felt,guess:u8,seed:u128)");
     const U64: u128 = 0xffffffffffffffff_u128; // 2**64-1
     const WEI_UNIT: u256 = 0xDE0B6B3A7640000; // 1e18
     const FEE_PRECISION: u128 = 1_000_000;
@@ -196,7 +195,6 @@ mod StarkFlip {
         game_id: felt252,
         guess: u8,
         seed: u128,
-        timestamp: u128,
     }
 
     // --------------- External Accessors ---------------
@@ -321,16 +319,13 @@ mod StarkFlip {
             self.reentrancy.end();
         }
 
-        fn settle(
-            ref self: ContractState, game_id: felt252, timestamp: u128, signature: Array<felt252>
-        ) {
+        fn settle(ref self: ContractState, game_id: felt252, signature: Array<felt252>) {
             self.reentrancy.start();
             let mut game = self.games.read(game_id);
             assert(game.pool != 0, 'STARKFLIP: Invalid Game');
 
             let pool = self.pools.read(game.pool);
-            let msgHash = self
-                .get_message_hash(game_id, game.guess, game.seed, timestamp, pool.dealer);
+            let msgHash = self.get_message_hash(game_id, game.guess, game.seed, pool.dealer);
 
             let sig_r = signature.at(0);
             let sig_s = signature.at(1);
@@ -346,7 +341,8 @@ mod StarkFlip {
             let mut result = PoseidonTrait::new();
             result = result.update_with(*sig_r);
             result = result.update_with(*sig_s);
-            result = result.update_with(timestamp);
+            result = result.update_with(game.guess);
+            result = result.update_with(game.seed);
 
             let hash = result.finalize();
             let hash_u256: u256 = hash.into();
@@ -444,12 +440,7 @@ mod StarkFlip {
         }
 
         fn get_message_hash(
-            self: @ContractState,
-            game_id: felt252,
-            guess: u8,
-            seed: u128,
-            timestamp: u128,
-            signer: ContractAddress
+            self: @ContractState, game_id: felt252, guess: u8, seed: u128, signer: ContractAddress
         ) -> felt252 {
             let domain = StarknetDomain {
                 name: 'StarkFlip', version: 1, chain_id: get_tx_info().unbox().chain_id
@@ -459,7 +450,7 @@ mod StarkFlip {
             state = state.update_with(domain.hash_struct());
             // This can be a field within the struct, it doesn't have to be get_caller_address().
             state = state.update_with(signer);
-            let settle = Settle { game_id, guess, seed, timestamp };
+            let settle = Settle { game_id, guess, seed };
             state = state.update_with(settle.hash_struct());
             // Hashing with the amount of elements being hashed 
             state = state.update_with(4);
@@ -529,8 +520,7 @@ mod StarkFlip {
             state = state.update_with(*self.game_id);
             state = state.update_with(*self.guess);
             state = state.update_with(*self.seed);
-            state = state.update_with(*self.timestamp);
-            state = state.update_with(5);
+            state = state.update_with(4);
             state.finalize()
         }
     }
