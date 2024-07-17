@@ -16,7 +16,7 @@ trait IStarkFlip<TContractState> {
     );
     fn create_game(ref self: TContractState, pool_id: felt252, staked: u256, guess: u8);
     fn settle(
-        ref self: TContractState, game_id: felt252, timestamp: u128, signature: Array<felt252>
+        ref self: TContractState, game_id: felt252, timestamp: u64, signature: Array<felt252>
     );
     fn cancel_game(ref self: TContractState, game_id: felt252);
     fn update_unit_point(ref self: TContractState, unit_point: u256);

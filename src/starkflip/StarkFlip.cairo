@@ -23,7 +23,7 @@ mod StarkFlip {
     const STARKNET_DOMAIN_TYPE_HASH: felt252 =
         selector!("StarkNetDomain(name:felt,version:felt,chainId:felt)");
     const GAME_STRUCT_TYPE_HASH: felt252 =
-        selector!("Settle(game_id:felt,guess:u8,seed:u128,timestamp:u128)");
+        selector!("Settle(game_id:felt,guess:u8,seed:u128,timestamp:u64)");
     const U64: u128 = 0xffffffffffffffff_u128; // 2**64-1
     const WEI_UNIT: u256 = 0xDE0B6B3A7640000; // 1e18
     const FEE_PRECISION: u128 = 1_000_000;
@@ -196,7 +196,7 @@ mod StarkFlip {
         game_id: felt252,
         guess: u8,
         seed: u128,
-        timestamp: u128,
+        timestamp: u64,
     }
 
     // --------------- External Accessors ---------------
@@ -322,7 +322,7 @@ mod StarkFlip {
         }
 
         fn settle(
-            ref self: ContractState, game_id: felt252, timestamp: u128, signature: Array<felt252>
+            ref self: ContractState, game_id: felt252, timestamp: u64, signature: Array<felt252>
         ) {
             self.reentrancy.start();
             let mut game = self.games.read(game_id);
@@ -346,6 +346,8 @@ mod StarkFlip {
             let mut result = PoseidonTrait::new();
             result = result.update_with(*sig_r);
             result = result.update_with(*sig_s);
+            result = result.update_with(game.guess);
+            result = result.update_with(game.seed);
             result = result.update_with(timestamp);
 
             let hash = result.finalize();
@@ -448,7 +450,7 @@ mod StarkFlip {
             game_id: felt252,
             guess: u8,
             seed: u128,
-            timestamp: u128,
+            timestamp: u64,
             signer: ContractAddress
         ) -> felt252 {
             let domain = StarknetDomain {
